@@ -262,17 +262,19 @@ function onRecipientsChangedHandler(event) {
         var removed = [];
         var fixes = [];
         fields.forEach(function (f, i) {
-          var keep = cur[i].filter(function (r) { return origSet[addrKey(r)]; });
+          // New colleagues @iriskpo.in are fine; only new external addresses are taken out.
+          var isNewExternal = function (r) { return !origSet[addrKey(r)] && isExternal(r.emailAddress, dom); };
+          var keep = cur[i].filter(function (r) { return !isNewExternal(r); });
           if (keep.length !== cur[i].length) {
-            cur[i].forEach(function (r) { if (!origSet[addrKey(r)]) removed.push(r.emailAddress || r.displayName); });
+            cur[i].forEach(function (r) { if (isNewExternal(r)) removed.push(r.emailAddress || r.displayName); });
             var list = keep.map(function (r) { return { displayName: r.displayName || r.emailAddress, emailAddress: r.emailAddress }; });
             fixes.push(call(function (cb) { f[1].setAsync(list, cb); }, null));
           }
         });
         if (!involvesExternal || !removed.length) { done(); return; }
         Promise.all(fixes).then(function () {
-          var msg = "Removed " + removed.join(", ") + ": new recipients can't be added to a reply on an external email. Start a new email if they need this.";
-          if (msg.length > 150) msg = "Removed " + removed.length + " added recipient(s): new recipients can't be added to a reply on an external email.";
+          var msg = "Removed " + removed.join(", ") + ": external recipients can't be added to a reply. Start a new email if they need this.";
+          if (msg.length > 150) msg = "Removed " + removed.length + " external recipient(s): external recipients can't be added to a reply.";
           try {
             item.notificationMessages.replaceAsync(NOTICE_KEY, {
               type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
@@ -344,7 +346,7 @@ function runCheck(item, progress) {
     if (r[2]) {
       var orig = {};
       r[2].forEach(function (k) { orig[k] = true; });
-      rep.added = rep.to.concat(rep.cc, rep.bcc).filter(function (x) { return !orig[addrKey(x)]; });
+      rep.added = rep.to.concat(rep.cc, rep.bcc).filter(function (x) { return !orig[addrKey(x)] && isExternal(x.emailAddress, dom); });
     }
     return rep;
   });
@@ -389,7 +391,7 @@ function buildMessage(rep, maxPerField, shortNames) {
     }
     if (addedBlock) {
       lines.push("");
-      lines.push("You can't add new recipients to a reply. Please remove:");
+      lines.push("You can't add external recipients to a reply. Please remove:");
       lines.push(rep.added.map(function (r) {
         var a = r.emailAddress || r.displayName || "?";
         return a + (isExternal(a, rep.domain) ? " (EXTERNAL)" : "");
