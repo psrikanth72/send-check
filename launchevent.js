@@ -129,14 +129,30 @@ function classifyFile(name, b) {
 
 /* ============================ Outlook helpers ============================ */
 
-function call(fn) {
-  // Wraps Outlook's callback-style "...Async" methods in a Promise.
-  return new Promise(function (resolve, reject) {
-    fn(function (r) {
-      if (r.status === Office.AsyncResultStatus.Succeeded) resolve(r.value);
-      else reject(r.error || new Error("Outlook request failed"));
-    });
+// Time limits so the pop-up always appears quickly and never hangs.
+var STEP_TIMEOUT_MS = 2500;   // any single Outlook request
+var TOTAL_TIMEOUT_MS = 4000;  // whole check; unfinished files become "check manually"
+
+function withTimeout(promise, ms, fallback) {
+  return new Promise(function (resolve) {
+    var done = false;
+    var t = setTimeout(function () { if (!done) { done = true; resolve(fallback); } }, ms);
+    promise.then(function (v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+                 function () { if (!done) { done = true; clearTimeout(t); resolve(fallback); } });
   });
+}
+
+function call(fn, fallback) {
+  // Wraps Outlook's callback-style "...Async" methods in a Promise with a time limit.
+  var p = new Promise(function (resolve, reject) {
+    try {
+      fn(function (r) {
+        if (r && r.status === Office.AsyncResultStatus.Succeeded) resolve(r.value);
+        else reject(r && r.error);
+      });
+    } catch (e) { reject(e); }
+  });
+  return withTimeout(p, STEP_TIMEOUT_MS, fallback);
 }
 
 function domainOf(addr) {
@@ -144,63 +160,43 @@ function domainOf(addr) {
   return p >= 0 ? String(addr).slice(p + 1).toLowerCase() : "";
 }
 
-function myDomain(item) {
-  if (MY_DOMAIN) return Promise.resolve(MY_DOMAIN.toLowerCase());
-  var fallback = (Office.context.mailbox.userProfile || {}).emailAddress || "";
-  var getFrom = item.from && item.from.getAsync
-    ? call(function (cb) { item.from.getAsync(cb); }).then(function (f) { return (f && f.emailAddress) || fallback; },
-                                                           function () { return fallback; })
-    : Promise.resolve(fallback);
-  return getFrom.then(function (addr) {
-    var d = domainOf(addr);
-    return PUBLIC_DOMAINS.indexOf(d) >= 0 ? "" : d;
-  });
+function myDomain() {
+  if (MY_DOMAIN) return MY_DOMAIN.toLowerCase();
+  var d = domainOf(((Office.context.mailbox || {}).userProfile || {}).emailAddress);
+  return PUBLIC_DOMAINS.indexOf(d) >= 0 ? "" : d;
 }
 
 function getRecipients(field) {
   if (!field || !field.getAsync) return Promise.resolve([]);
-  return call(function (cb) { field.getAsync(cb); }).then(function (v) { return v || []; }, function () { return []; });
+  return call(function (cb) { field.getAsync(cb); }, []).then(function (v) { return v || []; });
 }
+
+var CHECK_MANUALLY = { code: UNKNOWN, note: "check manually" };
 
 function checkAttachment(item, att) {
-  if (att.attachmentType === "item") return Promise.resolve({ code: NOT_PROTECTED, note: "attached email, can't hold a password" });
-  if (att.attachmentType === "cloud") return Promise.resolve({ code: UNKNOWN, note: "cloud link, check who can open it" });
-  if (att.size > MAX_SCAN_BYTES) return Promise.resolve({ code: UNKNOWN, note: "too large to scan, check manually" });
+  if (att.attachmentType === "item") return Promise.resolve({ code: NOT_PROTECTED, note: "attached email" });
+  if (att.attachmentType === "cloud") return Promise.resolve({ code: UNKNOWN, note: "cloud link, check sharing" });
+  if (att.size > MAX_SCAN_BYTES) return Promise.resolve({ code: UNKNOWN, note: "too large, check manually" });
   var ext = extOf(att.name);
-  if (ext === "7z" || ext === "rar") return Promise.resolve(classifyFile(att.name, null));
-  return call(function (cb) { item.getAttachmentContentAsync(att.id, cb); }).then(function (c) {
-    if (c.format !== "base64") return { code: UNKNOWN, note: "couldn't read it, check manually" };
-    return classifyFile(att.name, base64ToBytes(c.content));
-  }, function () {
-    return { code: UNKNOWN, note: "couldn't read it, check manually" };
+  if (ext === "7z" || ext === "rar") return Promise.resolve(CHECK_MANUALLY);
+  return call(function (cb) { item.getAttachmentContentAsync(att.id, cb); }, null).then(function (c) {
+    if (!c || c.format !== "base64") return CHECK_MANUALLY;
+    try { return classifyFile(att.name, base64ToBytes(c.content)); } catch (e) { return CHECK_MANUALLY; }
   });
-}
-
-function mentionsAttachment(item) {
-  return call(function (cb) { item.body.getAsync(Office.CoercionType.Text, cb); }).then(function (text) {
-    text = String(text || "");
-    var cut = text.search(/\r?\nFrom:/i);           // ignore the quoted earlier emails
-    if (cut >= 0) text = text.slice(0, cut);
-    return /attach|enclosed/i.test(text);
-  }, function () { return false; });
 }
 
 /* ============================ the check itself ============================ */
 
 function runCheck(item) {
-  return Promise.all([
-    myDomain(item),
-    getRecipients(item.to), getRecipients(item.cc), getRecipients(item.bcc),
-    call(function (cb) { item.getAttachmentsAsync(cb); }).catch(function () { return []; })
-  ]).then(function (r) {
-    var dom = r[0], to = r[1], cc = r[2], bcc = r[3];
-    var atts = (r[4] || []).filter(function (a) { return !a.isInline; });
-    return Promise.all(atts.map(function (a) { return checkAttachment(item, a); })).then(function (results) {
-      var needMention = atts.length === 0 ? mentionsAttachment(item) : Promise.resolve(false);
-      return needMention.then(function (mentioned) {
-        return { domain: dom, to: to, cc: cc, bcc: bcc, atts: atts, results: results, mentionedButMissing: mentioned };
-      });
-    });
+  var recipientsP = Promise.all([getRecipients(item.to), getRecipients(item.cc), getRecipients(item.bcc)]);
+  var attsP = call(function (cb) { item.getAttachmentsAsync(cb); }, []).then(function (list) {
+    var atts = (list || []).filter(function (a) { return !a.isInline; });
+    // Scan all files at the same time; anything not finished in time is "check manually".
+    var scans = atts.map(function (a) { return withTimeout(checkAttachment(item, a), TOTAL_TIMEOUT_MS, CHECK_MANUALLY); });
+    return Promise.all(scans).then(function (results) { return { atts: atts, results: results }; });
+  });
+  return Promise.all([recipientsP, attsP]).then(function (r) {
+    return { domain: myDomain(), to: r[0][0], cc: r[0][1], bcc: r[0][2], atts: r[1].atts, results: r[1].results };
   });
 }
 
@@ -216,49 +212,37 @@ function formatRecipients(list, dom, maxShown) {
   return { text: shown.join(", "), external: ext };
 }
 
-/* Builds the alert text. Outlook allows at most 500 characters. */
-function buildMessage(rep, markdown, maxPerField) {
-  var B = markdown ? "**" : "";
-  var issues = 0, external = 0, lines = [];
+/* Builds the pop-up text (Outlook allows at most 500 characters). */
+function buildMessage(rep, maxPerField, shortNames) {
+  var lines = [], unprotected = 0;
 
-  lines.push(B + "Check before sending" + B);
-  lines.push("");
-  var fields = [["To", rep.to], ["Cc", rep.cc], ["Bcc", rep.bcc]];
-  fields.forEach(function (f) {
-    if (!f[1].length) return;
-    var fr = formatRecipients(f[1], rep.domain, maxPerField);
-    external += fr.external;
-    lines.push("- " + f[0] + ": " + fr.text);
+  lines.push("Have you included the correct recipients?");
+  [["To", rep.to], ["Cc", rep.cc], ["Bcc", rep.bcc]].forEach(function (f) {
+    if (f[1].length) lines.push(f[0] + ": " + formatRecipients(f[1], rep.domain, maxPerField).text);
   });
-  if (!rep.to.length && !rep.cc.length && !rep.bcc.length) lines.push("- No recipients");
+  if (!rep.to.length && !rep.cc.length && !rep.bcc.length) lines.push("(no recipients)");
 
-  lines.push("");
-  if (!rep.atts.length) {
-    lines.push(B + "Attachments:" + B + " none");
-    if (rep.mentionedButMissing) { issues++; lines.push("- Your email mentions an attachment, but nothing is attached"); }
-  } else {
-    lines.push(B + "Attachments:" + B);
+  if (rep.atts.length) {
+    lines.push("");
+    rep.results.forEach(function (res) { if (res.code !== PROTECTED) unprotected++; });
+    lines.push(unprotected ? "File Not Password Protected - please check:" : "All attachments are password protected:");
     rep.atts.forEach(function (a, i) {
       var res = rep.results[i];
-      var tag = res.code === PROTECTED ? "[OK]" : res.code === NOT_PROTECTED ? "[NO]" : "[??]";
-      if (res.code !== PROTECTED) issues++;
-      lines.push("- " + tag + " " + a.name + " - " + res.note);
+      var name = a.name;
+      if (shortNames && name.length > 30) name = name.slice(0, 27) + "...";
+      if (res.code === PROTECTED) lines.push("✔ " + name + " - protected");
+      else if (res.code === NOT_PROTECTED) lines.push("✘ " + name + " - NOT password protected");
+      else lines.push("? " + name + " - " + res.note);
     });
   }
-
-  if (external || issues) lines.push("");
-  if (external) lines.push(external + " external recipient(s) - make sure they should get this.");
-  if (issues) lines.push(B + issues + " item(s) need your attention." + B);
-
-  return { text: lines.join("\n"), issues: issues, external: external };
+  return { text: lines.join("\n"), unprotected: unprotected };
 }
 
-function fitMessage(rep, markdown) {
-  var LIMIT = 500;
-  var tries = [5, 3, 2, 1];
-  var m;
+function fitMessage(rep) {
+  var LIMIT = 500, m;
+  var tries = [[6, false], [3, false], [2, true], [1, true]];
   for (var i = 0; i < tries.length; i++) {
-    m = buildMessage(rep, markdown, tries[i]);
+    m = buildMessage(rep, tries[i][0], tries[i][1]);
     if (m.text.length <= LIMIT) return m;
   }
   m.text = m.text.slice(0, LIMIT - 20) + "\n...(list shortened)";
@@ -268,40 +252,61 @@ function fitMessage(rep, markdown) {
 /* ============================ event handlers ============================ */
 
 function onMessageSendHandler(event) {
-  var item = Office.context.mailbox.item;
-  runCheck(item).then(function (rep) {
-    var md = Office.context.requirements.isSetSupported("Mailbox", "1.15");
-    var m = fitMessage(rep, md);
-    var opts = { allowEvent: false };     // shows the alert with "Send" / "Don't Send"
-    if (md) opts.errorMessageMarkdown = m.text; else opts.errorMessage = m.text;
-    event.completed(opts);
-  }).catch(function (e) {
-    event.completed({
-      allowEvent: false,
-      errorMessage: "Send check couldn't finish (" + ((e && e.message) || "unknown error") +
-        "). Please check the recipients and attachments yourself."
+  var finished = false;
+  function finish(text) {
+    if (finished) return;
+    finished = true;
+    try {
+      event.completed({ allowEvent: false, errorMessage: text });   // shows "Send" / "Don't Send"
+    } catch (e) {
+      try { event.completed({ allowEvent: false, errorMessage: "Have you included the correct recipients? Please also check your attachments." }); } catch (e2) {}
+    }
+  }
+  // Safety net: whatever happens, show the pop-up within 5 seconds.
+  setTimeout(function () {
+    finish("Have you included the correct recipients?\n\nSend Check couldn't finish in time - please check the recipients and that attachments are password protected.");
+  }, 5000);
+
+  try {
+    runCheck(Office.context.mailbox.item).then(function (rep) {
+      finish(fitMessage(rep).text);
+    }, function () {
+      finish("Have you included the correct recipients?\n\nSend Check couldn't read this email - please check the recipients and attachments yourself.");
     });
-  });
+  } catch (e) {
+    finish("Have you included the correct recipients?\n\nPlease check the recipients and attachments yourself.");
+  }
 }
 
 /* Optional "Run send check" button in the compose ribbon: shows a short summary. */
 function runCheckNow(event) {
-  var item = Office.context.mailbox.item;
-  runCheck(item).then(function (rep) {
-    var m = buildMessage(rep, false, 1);
-    var nRec = rep.to.length + rep.cc.length + rep.bcc.length;
-    var summary = nRec + " recipient(s), " + m.external + " external; " + rep.atts.length + " attachment(s), " +
-      m.issues + " need attention. Full check appears when you click Send.";
-    item.notificationMessages.replaceAsync("sendcheck", {
-      type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
-      message: summary.slice(0, 150), icon: "Icon.16x16", persistent: false
+  try {
+    var item = Office.context.mailbox.item;
+    runCheck(item).then(function (rep) {
+      var m = buildMessage(rep, 1, true);
+      var n = rep.to.length + rep.cc.length + rep.bcc.length;
+      var summary = n + " recipient(s); " + rep.atts.length + " attachment(s), " + m.unprotected +
+        " not password protected. Full check appears when you click Send.";
+      item.notificationMessages.replaceAsync("sendcheck", {
+        type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
+        message: summary.slice(0, 150), icon: "Icon.16x16", persistent: false
+      }, function () { event.completed(); });
     }, function () { event.completed(); });
-  }).catch(function () { event.completed(); });
+  } catch (e) { event.completed(); }
 }
 
-if (typeof Office !== "undefined" && Office.actions) {
-  Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
-  Office.actions.associate("runCheckNow", runCheckNow);
+/* Register the handlers. Done both immediately and once Office is ready, so it always works. */
+function registerHandlers() {
+  try {
+    if (typeof Office !== "undefined" && Office.actions && Office.actions.associate) {
+      Office.actions.associate("onMessageSendHandler", onMessageSendHandler);
+      Office.actions.associate("runCheckNow", runCheckNow);
+    }
+  } catch (e) {}
+}
+registerHandlers();
+if (typeof Office !== "undefined" && Office.onReady) {
+  try { Office.onReady(registerHandlers); } catch (e) {}
 }
 
 // For local testing in Node only.
