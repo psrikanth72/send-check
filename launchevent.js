@@ -191,6 +191,9 @@ function checkAttachment(item, att) {
 // Stored with item.sessionData (Outlook Mailbox 1.11+).
 var ORIG_KEY = "sendcheck_original_recipients";
 var FWD_KEY = "sendcheck_is_forward";   // set when the email was started with Forward
+var NEW_KEY = "sendcheck_is_new";       // set when the email was started with New mail
+// Shown when a new email is addressed outside iriskpo.in.
+var NEW_EMAIL_HINT = "Please use the company email module for new emails to external contacts.";
 
 function addrKey(r) {
   return String((r && (r.emailAddress || r.displayName)) || "").trim().toLowerCase();
@@ -208,7 +211,9 @@ function onNewComposeHandler(event) {
     var item = Office.context.mailbox.item;
     // A reply/reply-all already has a conversation and starts with recipients.
     // A new email has no conversation yet; a forward starts with no recipients.
-    if (!item.conversationId || !item.sessionData || !item.sessionData.setAsync) { done(); return; }
+    if (!item.sessionData || !item.sessionData.setAsync) { done(); return; }
+    // No conversation yet = a brand-new email.
+    if (!item.conversationId) { item.sessionData.setAsync(NEW_KEY, "1", function () { done(); }); return; }
     allRecipients(item).then(function (r) {
       var list = r[0].concat(r[1], r[2]).map(addrKey).filter(Boolean);
       if (!list.length) {
@@ -219,6 +224,24 @@ function onNewComposeHandler(event) {
       item.sessionData.setAsync(ORIG_KEY, JSON.stringify(list), function () { done(); });
     }, done);
   } catch (e) { done(); }
+}
+
+function getFlag(item, key) {
+  if (!item.sessionData || !item.sessionData.getAsync) return Promise.resolve(false);
+  return call(function (cb) { item.sessionData.getAsync(key, cb); }, null).then(function (v) { return v === "1"; });
+}
+
+// A new email: flagged when it was opened. If the flag is missing (e.g. a draft reopened later),
+// anything whose subject doesn't start with RE:/FW: is treated as a new email.
+function getIsNew(item) {
+  return Promise.all([getFlag(item, NEW_KEY), getFlag(item, FWD_KEY), getOriginalRecipients(item)]).then(function (st) {
+    if (st[0]) return true;
+    if (st[1] || st[2]) return false;
+    if (!item.subject || !item.subject.getAsync) return false;
+    return call(function (cb) { item.subject.getAsync(cb); }, "").then(function (subj) {
+      return !/^\s*(re|fw|fwd|aw|wg|tr|rv|sv|vs)\s*:/i.test(String(subj || ""));
+    });
+  });
 }
 
 function getIsForward(item) {
@@ -248,10 +271,11 @@ function onRecipientsChangedHandler(event) {
   try {
     var item = Office.context.mailbox.item;
     var dom = myDomain();
-    Promise.all([getOriginalRecipients(item), getIsForward(item)]).then(function (st) {
-      var orig = st[0], isForward = st[1];
-      if (isForward) { removeExternalFromForward(item, dom, done); return; }
-      if (!orig) { done(); return; }                     // a new email: nothing to enforce
+    Promise.all([getOriginalRecipients(item), getIsForward(item), getFlag(item, NEW_KEY)]).then(function (st) {
+      var orig = st[0], isForward = st[1], isNew = st[2];
+      if (isForward) { removeExternal(item, dom, done, "emails can't be forwarded outside iriskpo.in."); return; }
+      if (isNew) { removeExternal(item, dom, done, "new emails can't go outside iriskpo.in. " + NEW_EMAIL_HINT); return; }
+      if (!orig) { done(); return; }                     // unknown (e.g. reopened draft): checked at Send
       var origSet = {};
       orig.forEach(function (k) { origSet[k] = true; });
       var fields = [["to", item.to], ["cc", item.cc], ["bcc", item.bcc]];
@@ -273,7 +297,7 @@ function onRecipientsChangedHandler(event) {
         });
         if (!involvesExternal || !removed.length) { done(); return; }
         Promise.all(fixes).then(function () {
-          var msg = "Removed " + removed.join(", ") + ": external recipients can't be added to a reply. Start a new email if they need this.";
+          var msg = "Removed " + removed.join(", ") + ": external recipients can't be added to a reply. Use the company email module if they need this.";
           if (msg.length > 150) msg = "Removed " + removed.length + " external recipient(s): external recipients can't be added to a reply.";
           try {
             item.notificationMessages.replaceAsync(NOTICE_KEY, {
@@ -287,8 +311,8 @@ function onRecipientsChangedHandler(event) {
   } catch (e) { done(); }
 }
 
-// Forward: colleagues at iriskpo.in are fine, any external address is taken back out.
-function removeExternalFromForward(item, dom, done) {
+// Forward / new email: colleagues at iriskpo.in are fine, any external address is taken back out.
+function removeExternal(item, dom, done, reason) {
   var fields = [item.to, item.cc, item.bcc];
   Promise.all(fields.map(getRecipients)).then(function (cur) {
     var removed = [], fixes = [];
@@ -302,8 +326,9 @@ function removeExternalFromForward(item, dom, done) {
     });
     if (!removed.length) { done(); return; }
     Promise.all(fixes).then(function () {
-      var msg = "Removed " + removed.join(", ") + ": emails can't be forwarded outside iriskpo.in.";
-      if (msg.length > 150) msg = "Removed " + removed.length + " external recipient(s): emails can't be forwarded outside iriskpo.in.";
+      var msg = "Removed " + removed.join(", ") + ": " + reason;
+      if (msg.length > 150) msg = "Removed " + removed.length + " external recipient(s): " + reason;
+      if (msg.length > 150) msg = "Removed " + removed.length + " external recipient(s): " + reason.split(". ")[0] + ".";
       try {
         item.notificationMessages.replaceAsync(NOTICE_KEY, {
           type: Office.MailboxEnums.ItemNotificationMessageType.InformationalMessage,
@@ -340,9 +365,10 @@ function runCheck(item, progress) {
     return Promise.all(scans).then(function (results) { return { atts: atts, results: results }; });
   });
   var fwdP = getIsForward(item);
-  return Promise.all([recipientsP, attsP, origP, fwdP]).then(function (r) {
+  var newP = getIsNew(item);
+  return Promise.all([recipientsP, attsP, origP, fwdP, newP]).then(function (r) {
     var rep = { domain: dom, to: r[0][0], cc: r[0][1], bcc: r[0][2], atts: r[1].atts, results: r[1].results,
-                isReply: !!r[2], isForward: !!r[3], added: [] };
+                isReply: !!r[2], isForward: !!r[3], isNew: !!r[4], added: [] };
     if (r[2]) {
       var orig = {};
       r[2].forEach(function (k) { orig[k] = true; });
@@ -380,10 +406,18 @@ function buildMessage(rep, maxPerField, shortNames) {
 
   var addedBlock = external > 0 && rep.isReply && rep.added.length > 0;
   var forwardBlock = external > 0 && rep.isForward;
-  var fileBlock = external > 0 && unprotected > 0 && !forwardBlock;   // forward message already says it all
+  var newBlock = external > 0 && rep.isNew && !rep.isForward;
+  var fileBlock = external > 0 && unprotected > 0 && !forwardBlock && !newBlock;   // those messages already say it all
 
-  if (addedBlock || fileBlock || forwardBlock) {
+  if (addedBlock || fileBlock || forwardBlock || newBlock) {
     lines.push("EMAIL BLOCKED - this email is going outside iriskpo.in.");
+    if (newBlock) {
+      lines.push("");
+      lines.push("New emails can't be sent to external addresses from Outlook. Please remove:");
+      lines.push(formatRecipients(all, rep.domain, maxPerField, true).text);
+      lines.push("");
+      lines.push(NEW_EMAIL_HINT);
+    }
     if (forwardBlock) {
       lines.push("");
       lines.push("Emails can't be forwarded outside iriskpo.in. Please remove:");
@@ -396,7 +430,7 @@ function buildMessage(rep, maxPerField, shortNames) {
         var a = r.emailAddress || r.displayName || "?";
         return a + (isExternal(a, rep.domain) ? " (EXTERNAL)" : "");
       }).slice(0, maxPerField).join(", ") + (rep.added.length > maxPerField ? " +" + (rep.added.length - maxPerField) + " more" : ""));
-      lines.push("If they need this, start a new email instead.");
+      lines.push("If they need this, use the company email module.");
     }
     if (fileBlock) {
       lines.push("");
